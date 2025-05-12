@@ -19,7 +19,7 @@ def main():
     parser.add_argument(
         "--directorio", "-d",
         required=True,
-        help="Directorio con los archivos PAI (.xlsm)"
+        help="Directorio con los archivos PAI (.xlsm, .xlsx, etc.)"
     )
     
     parser.add_argument(
@@ -36,8 +36,8 @@ def main():
     
     parser.add_argument(
         "--patron", "-p",
-        default="*.xlsm",
-        help="Patrón para buscar archivos"
+        default="*.xls*",
+        help="Patrón para buscar archivos (default: '*.xls*' captura .xlsx, .xlsm, etc.)"
     )
     
     parser.add_argument(
@@ -57,6 +57,25 @@ def main():
         help="Tipo de consolidado: por lugar de residencia de la persona o por lugar de vacunación"
     )
     
+    parser.add_argument(
+        "--excluir", "-e",
+        nargs="+",  # Permite múltiples valores
+        default=["COVID"],
+        help="Patrones para excluir archivos (por defecto: COVID)"
+    )
+    
+    parser.add_argument(
+        "--directorio-exacto",
+        action="store_true",
+        help="Procesar solo los archivos en el directorio especificado, sin buscar en subdirectorios"
+    )
+    
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Mostrar información detallada durante el procesamiento"
+    )
+    
     args = parser.parse_args()
     
     # Verificar que el directorio de entrada existe
@@ -68,11 +87,22 @@ def main():
     os.makedirs(args.salida, exist_ok=True)
     
     print(f"Iniciando consolidación de datos para {args.vacuna}")
+    print(f"Directorio de datos: {args.directorio}")
+    print(f"Patrón de búsqueda: {args.patron}")
+    if args.excluir:
+        print(f"Excluyendo archivos que contengan: {', '.join(args.excluir)}")
     print(f"Tipo de consolidado: {args.tipo_consolidado}")
+    if args.directorio_exacto:
+        print("Modo: Procesando solo el directorio especificado (sin subdirectorios)")
     
     # Procesar archivos
     processor = PaiProcessor(vacuna=args.vacuna, tipo_consolidado=args.tipo_consolidado)
-    resultado_consolidado = processor.consolidar_archivos(args.directorio, args.patron)
+    resultado_consolidado = processor.consolidar_archivos(
+        args.directorio, 
+        args.patron,
+        patrones_exclusion=args.excluir,
+        procesar_directorio_exacto=args.directorio_exacto
+    )
     
     if not resultado_consolidado:
         print("No se pudieron consolidar los datos.")
@@ -110,10 +140,25 @@ def main():
         print(f"- Total de registros: {len(df)}")
         
         if tipo == "vacunacion":
-            print(f"- Municipios de vacunación: {df['Municipio_Vacunacion'].nunique()}")
+            municipios_vacunacion = df["Municipio_Vacunacion"].nunique()
+            print(f"- Municipios de vacunación: {municipios_vacunacion}")
+            if municipios_vacunacion <= 10:  # Si son pocos, mostrarlos
+                top_municipios = df["Municipio_Vacunacion"].value_counts().head(10)
+                print("  Top municipios de vacunación:")
+                for mun, count in top_municipios.items():
+                    print(f"    - {mun}: {count} registros")
         else:
-            print(f"- Departamentos de residencia: {df['Departamento_Residencia'].nunique()}")
-            print(f"- Municipios de residencia: {df['Municipio_Residencia'].nunique()}")
+            dpto_count = df["Departamento_Residencia"].nunique()
+            muni_count = df["Municipio_Residencia"].nunique()
+            print(f"- Departamentos de residencia: {dpto_count}")
+            print(f"- Municipios de residencia: {muni_count}")
+            
+            # Mostrar top municipios
+            if muni_count <= 10:
+                top_municipios = df["Municipio_Residencia"].value_counts().head(10)
+                print("  Top municipios de residencia:")
+                for mun, count in top_municipios.items():
+                    print(f"    - {mun}: {count} registros")
         
         if "Vacunado" in df.columns:
             total_vacunados = df["Vacunado"].sum()
@@ -131,7 +176,8 @@ def main():
                 if col in df.columns:
                     total = df[col].sum()
                     if total > 0:
-                        print(f"  - {nombre}: {total} ({total/total_vacunados*100:.1f}%)")
+                        porcentaje = total/total_vacunados*100 if total_vacunados > 0 else 0
+                        print(f"  - {nombre}: {total} ({porcentaje:.1f}%)")
     
     print("\nProceso completado con éxito.")
 
