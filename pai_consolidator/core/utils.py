@@ -391,7 +391,8 @@ def clasificar_grupo_etario(edad_anios):
 def normalizar_nombres_columnas(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normaliza los nombres de columnas para tener un formato estándar.
-    Convierte nombres de tuplas a strings.
+    Versión optimizada para manejar encabezados jerárquicos de Excel con 
+    estructura específica de datos PAI.
     
     Args:
         df: DataFrame con columnas a normalizar.
@@ -404,51 +405,127 @@ def normalizar_nombres_columnas(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         # Para columnas jerárquicas (tuplas)
         if isinstance(col, tuple):
+            # Manejar caso especial de las primeras dos columnas sin encabezado en nivel 1
+            if len(col) >= 2 and col[0] == 'Unnamed: 0_level_0' and col[1] == 'Consecutivo':
+                nuevos_nombres[col] = 'Consecutivo'
+                continue
+            elif len(col) >= 2 and col[0] == 'Unnamed: 1_level_0' and 'Fecha de atención' in str(col[1]):
+                nuevos_nombres[col] = 'Fecha_Atencion'
+                continue
+                
+            # Obtener partes significativas
             partes = []
-            # Unir las partes no nulas de la tupla
             for parte in col:
                 if pd.notna(parte) and str(parte).strip():
-                    partes.append(str(parte).strip())
+                    # Ignorar partes como 'Unnamed: X_level_Y'
+                    if not str(parte).startswith('Unnamed:'):
+                        # Limpiar texto
+                        parte_str = str(parte).strip()
+                        # Reemplazar caracteres no alfanuméricos
+                        parte_str = re.sub(r'[^\w ]', '_', parte_str)
+                        # Convertir espacios a guiones bajos
+                        parte_str = re.sub(r'\s+', '_', parte_str)
+                        # Eliminar guiones bajos múltiples
+                        parte_str = re.sub(r'_+', '_', parte_str)
+                        # Eliminar guiones bajos al inicio/final
+                        parte_str = parte_str.strip('_')
+                        
+                        if parte_str:
+                            partes.append(parte_str)
             
+            # Construir nombre nuevo
             if partes:
-                nuevo_nombre = "_".join(partes)
-                # Reemplazar caracteres no alfanuméricos por guiones bajos
-                nuevo_nombre = re.sub(r'[^a-zA-Z0-9]', '_', nuevo_nombre)
-                # Eliminar guiones bajos múltiples
-                nuevo_nombre = re.sub(r'_+', '_', nuevo_nombre)
-                # Eliminar guiones bajos al inicio o final
-                nuevo_nombre = nuevo_nombre.strip('_')
-                nuevos_nombres[col] = nuevo_nombre
-        # Para columnas simples
-        elif pd.notna(col):
-            nuevo_nombre = str(col).strip()
-            # Reemplazar caracteres no alfanuméricos por guiones bajos
-            nuevo_nombre = re.sub(r'[^a-zA-Z0-9]', '_', nuevo_nombre)
-            # Eliminar guiones bajos múltiples
-            nuevo_nombre = re.sub(r'_+', '_', nuevo_nombre)
-            # Eliminar guiones bajos al inicio o final
-            nuevo_nombre = nuevo_nombre.strip('_')
+                # Unir partes con guiones bajos
+                nuevo_nombre = '_'.join(partes)
+            else:
+                # Si no hay partes válidas, usar un nombre genérico
+                idx = list(df.columns).index(col)
+                nuevo_nombre = f"Columna_{idx}"
+            
             nuevos_nombres[col] = nuevo_nombre
+        
+        # Para columnas simples (no tuplas)
+        else:
+            if pd.notna(col):
+                nuevo_nombre = str(col).strip()
+                # Limpiar texto
+                nuevo_nombre = re.sub(r'[^\w ]', '_', nuevo_nombre)
+                nuevo_nombre = re.sub(r'\s+', '_', nuevo_nombre)
+                nuevo_nombre = re.sub(r'_+', '_', nuevo_nombre)
+                nuevo_nombre = nuevo_nombre.strip('_')
+                
+                if not nuevo_nombre:
+                    idx = list(df.columns).index(col)
+                    nuevo_nombre = f"Columna_{idx}"
+                
+                nuevos_nombres[col] = nuevo_nombre
+            else:
+                idx = list(df.columns).index(col)
+                nuevos_nombres[col] = f"Columna_{idx}"
     
-    # Asegurar que no haya nombres duplicados
+    # Verificar y resolver nombres duplicados
     nombres_usados = set()
     for col, nuevo_nombre in list(nuevos_nombres.items()):
         if nuevo_nombre in nombres_usados:
-            # Si ya existe, añadir un sufijo numérico
-            base_nombre = nuevo_nombre
-            contador = 1
-            while nuevo_nombre in nombres_usados:
-                nuevo_nombre = f"{base_nombre}_{contador}"
-                contador += 1
-            nuevos_nombres[col] = nuevo_nombre
-        nombres_usados.add(nuevo_nombre)
+            # Si ya existe, añadir un sufijo numérico basado en la posición
+            idx = list(df.columns).index(col)
+            nuevos_nombres[col] = f"{nuevo_nombre}_{idx}"
+        nombres_usados.add(nuevos_nombres[col])
     
-    # Aplicar los nuevos nombres
+    # Aplicar renombrado
     df_normalizado = df.rename(columns=nuevos_nombres)
     
     # Verificar que todas las columnas se hayan normalizado
-    for col in df_normalizado.columns:
-        if isinstance(col, tuple):
-            print(f"  - ADVERTENCIA: Columna {col} no se normalizó correctamente")
+    columnas_problemáticas = [col for col in df_normalizado.columns if isinstance(col, tuple)]
     
     return df_normalizado
+
+def validar_normalizacion(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Valida que todas las columnas se hayan normalizado correctamente.
+    Aplica correcciones adicionales a columnas que siguen siendo tuplas.
+    
+    Args:
+        df: DataFrame a validar.
+        
+    Returns:
+        DataFrame con todas las columnas correctamente normalizadas.
+    """
+    # Identificar columnas que siguen siendo tuplas
+    columnas_problematicas = [col for col in df.columns if isinstance(col, tuple)]
+    
+    if columnas_problematicas:
+        # Crear diccionario para renombrar
+        nuevos_nombres = {}
+        
+        for col in columnas_problematicas:
+            # Crear nombre basado en contenido y posición
+            idx = list(df.columns).index(col)
+            
+            # Unir partes no nulas
+            partes = []
+            for parte in col:
+                if pd.notna(parte) and str(parte).strip():
+                    parte_str = str(parte).strip()
+                    # Convertir caracteres no alfanuméricos a guiones bajos
+                    parte_str = re.sub(r'[^\w]', '_', parte_str)
+                    # Eliminar guiones bajos múltiples
+                    parte_str = re.sub(r'_+', '_', parte_str)
+                    # Eliminar guiones bajos al inicio/final
+                    parte_str = parte_str.strip('_')
+                    
+                    if parte_str:
+                        partes.append(parte_str)
+            
+            if partes:
+                nuevo_nombre = f"{'_'.join(partes)}_{idx}"
+            else:
+                nuevo_nombre = f"Columna_{idx}"
+            
+            nuevos_nombres[col] = nuevo_nombre
+            print(f"  - Corrigiendo columna problemática: {col} -> {nuevo_nombre}")
+        
+        # Aplicar renombrado
+        df = df.rename(columns=nuevos_nombres)
+    
+    return df

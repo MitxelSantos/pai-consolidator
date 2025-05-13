@@ -38,8 +38,8 @@ def main():
     
     parser.add_argument(
         "--patron", "-p",
-        default="*.xls*",
-        help="Patrón para buscar archivos (.xlsm, .xlsx, etc.)"
+        help="Patrón personalizado para buscar archivos (por defecto: todos los formatos Excel)",
+        default=None
     )
     
     parser.add_argument(
@@ -94,6 +94,13 @@ def main():
         action="store_true",
         help="Generar archivo JSON con estadísticas"
     )
+
+    # Añadir este argumento después de los argumentos existentes en la función main()
+    parser.add_argument(
+        "--paralelo", "-P",
+        action="store_true",
+        help="Usar procesamiento paralelo para mejorar rendimiento con múltiples archivos"
+    )
     
     args = parser.parse_args()
     
@@ -116,6 +123,11 @@ def main():
     
     print("\n= PAI Consolidator =")
     print(f"Modo: {args.modo}")
+
+    if args.paralelo:
+        print("Procesamiento: Paralelo (multi-core)")
+    else:
+        print("Procesamiento: Secuencial (single-core)")
     
     if args.modo in ["todo", "consolidar"]:
         print(f"Directorio de entrada: {args.directorio}")
@@ -150,7 +162,8 @@ def main():
         df_consolidado = processor.consolidar_archivos(
             args.directorio,
             args.patron,
-            excluir_patrones
+            excluir_patrones,
+            usar_paralelo=args.paralelo
         )
         
         if df_consolidado.empty:

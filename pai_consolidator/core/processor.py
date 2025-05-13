@@ -7,6 +7,8 @@ import numpy as np
 from typing import List, Dict, Any, Tuple, Optional, Set
 from datetime import datetime
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 from .utils import (
     listar_archivos_pai,
     extraer_fecha_de_archivo,
@@ -15,8 +17,135 @@ from .utils import (
     leer_excel_con_estructura,
     clasificar_grupo_etario,
     limpiar_texto,
-    normalizar_nombres_columnas
+    normalizar_nombres_columnas,
+    validar_normalizacion
 )
+
+def _procesar_archivo_worker_paralelo(ruta, modo_detallado=False):
+    """
+    Versión independiente de la función de procesamiento para uso en paralelo.
+    Esta función debe estar a nivel de módulo para que pueda ser serializada.
+    
+    Args:
+        ruta: Ruta al archivo a procesar.
+        modo_detallado: Si True, muestra información detallada.
+        
+    Returns:
+        Tuple con (DataFrame procesado, número de registros, advertencias)
+    """
+    try:
+        # Importaciones necesarias aquí para que la función sea autocontenida
+        import os
+        import pandas as pd
+        from .utils import (
+            extraer_municipio_de_ruta,
+            extraer_fecha_de_archivo,
+            analizar_estructura_excel,
+            leer_excel_con_estructura,
+            normalizar_nombres_columnas,
+            validar_normalizacion
+        )
+        
+        # Extraer información básica del archivo
+        municipio = extraer_municipio_de_ruta(ruta)
+        info_fecha = extraer_fecha_de_archivo(ruta)
+        
+        if modo_detallado:
+            print(f"Procesando archivo: {os.path.basename(ruta)}")
+        
+        # Analizar estructura del archivo
+        estructura = analizar_estructura_excel(ruta, forzar_jerarquico=True)
+        
+        # Leer el archivo con la estructura adecuada
+        df, es_jerarquico = leer_excel_con_estructura(ruta, estructura)
+        
+        # Normalizar nombres de columnas
+        df = normalizar_nombres_columnas(df)
+        df = validar_normalizacion(df)
+            
+        # Añadir columnas de información adicional
+        df["Municipio_Vacunacion"] = municipio
+        df["Año_Registro"] = info_fecha.get("año")
+        df["Mes_Registro"] = info_fecha.get("mes")
+        df["Archivo_Origen"] = os.path.basename(ruta)
+        
+        # Intentar detectar y limpiar información clave
+        # 1. Fecha de atención/aplicación
+        columnas_fecha = []
+        for col in df.columns:
+            # Comprobar si es string porque ya hemos normalizado
+            if isinstance(col, str) and "fecha" in col.lower() and "atencion" in col.lower():
+                columnas_fecha.append(col)
+
+        if columnas_fecha:
+            col_fecha = columnas_fecha[0]
+            df = df[df[col_fecha].notna()]  # Eliminar filas sin fecha
+            try:
+                df["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
+            except Exception as e:
+                pass
+        else:
+            # Si no hay columna de fecha, usar la fecha del archivo
+            if info_fecha["año"] and info_fecha["mes"]:
+                fecha_str = f"{info_fecha['año']}-{info_fecha['mes']}-01"
+                df["Fecha"] = pd.to_datetime(fecha_str)
+            else:
+                df["Fecha"] = pd.NaT
+
+        # 2. Datos de identificación personal
+        columnas_id = {
+            "Tipo_Identificacion": ["tipo", "identificacion"],
+            "Numero_Identificacion": ["numero", "identificacion", "cedula"],
+            "Primer_Nombre": ["primer", "nombre"],
+            "Primer_Apellido": ["primer", "apellido"],
+            "Sexo": ["sexo", "genero"]
+        }
+        
+        for col_norm, términos in columnas_id.items():
+            for col in df.columns:
+                # Comprobar solo string ya que hemos normalizado
+                col_str = str(col).lower()
+                if all(term in col_str for term in términos):
+                    df[col_norm] = df[col]
+                    break
+        
+        # 3. Datos de residencia
+        columnas_residencia = {
+            "Departamento_Residencia": ["departamento", "residencia"],
+            "Municipio_Residencia": ["municipio", "residencia"],
+            "Localidad_Residencia": ["comuna", "localidad", "barrio"]
+        }
+        
+        for col_norm, términos in columnas_residencia.items():
+            for col in df.columns:
+                col_str = str(col).lower()
+                if all(term in col_str for term in términos):
+                    df[col_norm] = df[col].apply(lambda x: limpiar_texto(x) if pd.notna(x) else None)
+                    break
+        
+        # 4. Clasificar por grupo etario
+        columnas_edad = []
+        for col in df.columns:
+            col_str = str(col).lower()
+            if "año" in col_str or "edad" in col_str:
+                columnas_edad.append(col)
+                
+        if columnas_edad:
+            col_edad = columnas_edad[0]
+            try:
+                df["Edad_Num"] = pd.to_numeric(df[col_edad], errors="coerce")
+                df["Grupo_Etario"] = df["Edad_Num"].apply(clasificar_grupo_etario)
+            except Exception:
+                df["Grupo_Etario"] = "No especificado"
+        else:
+            df["Grupo_Etario"] = "No especificado"
+        
+        # Devolver DataFrame y número de registros
+        return df, len(df), []  # DataFrame, num_registros, advertencias
+    except Exception as e:
+        # Capturar cualquier error para no detener el proceso
+        error_msg = f"Error al procesar {os.path.basename(ruta)}: {str(e)}"
+        return pd.DataFrame(), 0, [error_msg]
 
 class PaiProcessor:
     """
@@ -102,9 +231,10 @@ class PaiProcessor:
             
             # Normalizar nombres de columnas (especialmente para encabezados jerárquicos)
             df = normalizar_nombres_columnas(df)
+            df = validar_normalizacion(df)
             
             if self.modo_detallado:
-                print(f"  - Nombres de columnas normalizados")
+                print(f"  - Nombres de columnas normalizados y validados")
                 
             # Añadir columnas de información adicional
             df["Municipio_Vacunacion"] = municipio
@@ -236,8 +366,73 @@ class PaiProcessor:
             
             return pd.DataFrame()
     
+    def procesar_archivos_paralelo(self, archivos, max_workers=None):
+        """
+        Procesa múltiples archivos PAI en paralelo para mejorar rendimiento.
+        
+        Args:
+            archivos: Lista de rutas de archivos a procesar.
+            max_workers: Número máximo de procesos (None = auto).
+            
+        Returns:
+            DataFrame consolidado con todos los datos.
+        """
+        # Determinar número óptimo de workers
+        if max_workers is None:
+            max_workers = min(multiprocessing.cpu_count(), len(archivos))
+        
+        print(f"Procesando {len(archivos)} archivos en paralelo con {max_workers} procesos...")
+        
+        # Lista para almacenar resultados
+        resultados = []
+        
+        # Usar ProcessPoolExecutor para procesamiento paralelo
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Enviar trabajos - utilizando la función a nivel de módulo
+            futuros = {executor.submit(
+                _procesar_archivo_worker_paralelo, 
+                archivo, 
+                self.modo_detallado
+            ): archivo for archivo in archivos}
+            
+            # Procesar resultados a medida que se completan
+            for i, futuro in enumerate(as_completed(futuros), 1):
+                archivo = futuros[futuro]
+                try:
+                    df, num_registros, advertencias_archivo = futuro.result()
+                    
+                    if not df.empty:
+                        resultados.append(df)
+                        self.archivos_procesados += 1
+                        self.registros_totales += num_registros
+                        print(f"[{i}/{len(archivos)}] Procesado: {os.path.basename(archivo)} ({num_registros} registros)")
+                    else:
+                        print(f"[{i}/{len(archivos)}] Sin datos: {os.path.basename(archivo)}")
+                    
+                    # Registrar advertencias
+                    for adv in advertencias_archivo:
+                        self.advertencias.append(adv)
+                        if self.modo_detallado:
+                            print(f"  - {adv}")
+                    
+                except Exception as e:
+                    error_msg = f"Error al procesar {os.path.basename(archivo)}: {str(e)}"
+                    self.advertencias.append(error_msg)
+                    print(f"[{i}/{len(archivos)}] {error_msg}")
+        
+        # Combinar todos los DataFrames
+        if resultados:
+            print(f"\nCombinando {len(resultados)} archivos procesados...")
+            df_combinado = pd.concat(resultados, ignore_index=True)
+            print(f"Consolidación completada: {len(df_combinado)} registros totales")
+            return df_combinado
+        else:
+            print("No se pudo procesar ningún archivo correctamente.")
+            return pd.DataFrame()
+    
     def consolidar_archivos(self, directorio: str, patron: str = "*.xls*", 
-                           excluir_patrones: List[str] = None) -> pd.DataFrame:
+                           excluir_patrones: List[str] = None,
+                           usar_paralelo: bool = True) -> pd.DataFrame:
         """
         Consolida todos los datos de archivos PAI en un directorio.
         
@@ -245,6 +440,7 @@ class PaiProcessor:
             directorio: Carpeta base donde están los registros.
             patron: Patrón para identificar archivos (default: "*.xls*").
             excluir_patrones: Lista de patrones a excluir (ej. ["COVID", "respaldo"])
+            usar_paralelo: Si True, usa procesamiento paralelo para mejorar rendimiento.
             
         Returns:
             DataFrame consolidado con todos los datos.
@@ -268,51 +464,56 @@ class PaiProcessor:
         
         print(f"Se encontraron {len(archivos)} archivos para procesar...")
         
-        # Lista para almacenar DataFrames
-        dfs = []
-        
-        # Procesar cada archivo
-        for i, archivo in enumerate(archivos, 1):
-            print(f"\nProcesando archivo {i}/{len(archivos)}: {os.path.basename(archivo)}")
-            try:
-                df = self.procesar_archivo(archivo)
-                if not df.empty:
-                    dfs.append(df)
-                elif not self.ignorar_errores:
-                    print(f"  - El archivo no produjo datos válidos")
+        # Procesar archivos
+        if usar_paralelo and len(archivos) > 1:
+            # Usar procesamiento paralelo
+            df_combinado = self.procesar_archivos_paralelo(archivos)
+        else:
+            # Lista para almacenar DataFrames
+            dfs = []
+            
+            # Procesar cada archivo secuencialmente
+            for i, archivo in enumerate(archivos, 1):
+                print(f"\nProcesando archivo {i}/{len(archivos)}: {os.path.basename(archivo)}")
+                try:
+                    df = self.procesar_archivo(archivo)
+                    if not df.empty:
+                        dfs.append(df)
+                    elif not self.ignorar_errores:
+                        print(f"  - El archivo no produjo datos válidos")
+                        if not self.ignorar_errores:
+                            print("  - Deteniendo procesamiento. Use --ignorar-errores para continuar.")
+                            break
+                except Exception as e:
+                    error_msg = f"Error al procesar {os.path.basename(archivo)}: {str(e)}"
+                    self.advertencias.append(error_msg)
+                    print(f"  - {error_msg}")
                     if not self.ignorar_errores:
                         print("  - Deteniendo procesamiento. Use --ignorar-errores para continuar.")
                         break
-            except Exception as e:
-                error_msg = f"Error al procesar {os.path.basename(archivo)}: {str(e)}"
-                self.advertencias.append(error_msg)
-                print(f"  - {error_msg}")
-                if not self.ignorar_errores:
-                    print("  - Deteniendo procesamiento. Use --ignorar-errores para continuar.")
-                    break
+            
+            # Combinar todos los DataFrames
+            if dfs:
+                print(f"\nCombinando {len(dfs)} archivos procesados...")
+                df_combinado = pd.concat(dfs, ignore_index=True)
+                print(f"Consolidación completada: {len(df_combinado)} registros totales")
+            else:
+                print("No se pudo procesar ningún archivo correctamente.")
+                df_combinado = pd.DataFrame()
         
-        # Combinar todos los DataFrames
-        if dfs:
-            print(f"\nCombinando {len(dfs)} archivos procesados...")
-            df_combinado = pd.concat(dfs, ignore_index=True)
-            print(f"Consolidación completada: {len(df_combinado)} registros totales")
+        # Guardar resultados para uso posterior
+        self.datos_consolidados = df_combinado
+        
+        # Mostrar advertencias
+        if self.advertencias:
+            print("\nAdvertencias durante el procesamiento:")
+            for i, adv in enumerate(self.advertencias[:10], 1):
+                print(f"{i}. {adv}")
             
-            # Guardar resultados para uso posterior
-            self.datos_consolidados = df_combinado
-            
-            # Mostrar advertencias
-            if self.advertencias:
-                print("\nAdvertencias durante el procesamiento:")
-                for i, adv in enumerate(self.advertencias[:10], 1):
-                    print(f"{i}. {adv}")
-                
-                if len(self.advertencias) > 10:
-                    print(f"... y {len(self.advertencias) - 10} advertencias más")
-            
-            return df_combinado
-        else:
-            print("No se pudo procesar ningún archivo correctamente.")
-            return pd.DataFrame()
+            if len(self.advertencias) > 10:
+                print(f"... y {len(self.advertencias) - 10} advertencias más")
+        
+        return df_combinado
     
     def filtrar_por_vacuna(self, vacuna: str = "Fiebre amarilla", 
                       tipo_consolidado: str = "vacunacion") -> dict:
@@ -337,12 +538,7 @@ class PaiProcessor:
         columnas_vacuna = []
         
         for col in df.columns:
-            # Comprobar si es una tupla o string
-            if isinstance(col, tuple):
-                col_str = " ".join([str(parte) for parte in col if pd.notna(parte)]).lower()
-            else:
-                col_str = str(col).lower()
-                
+            col_str = str(col).lower()
             if vacuna_lower in col_str:
                 columnas_vacuna.append(col)
         
@@ -363,11 +559,7 @@ class PaiProcessor:
         # Intentar identificar columnas de dosis
         columnas_dosis = []
         for col in columnas_vacuna:
-            if isinstance(col, tuple):
-                col_str = " ".join([str(parte) for parte in col if pd.notna(parte)]).lower()
-            else:
-                col_str = str(col).lower()
-                
+            col_str = str(col).lower()
             if "dosis" in col_str:
                 columnas_dosis.append(col)
         
