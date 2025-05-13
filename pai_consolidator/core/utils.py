@@ -22,6 +22,10 @@ def listar_archivos_pai(directorio_base: str, patron: str = "*.xls*",
     Returns:
         Lista de rutas a archivos PAI encontrados.
     """
+    # Garantizar que siempre tengamos un patrón válido para archivos Excel
+    if patron is None:
+        patron = "*.xls*"  # Captura xlsx, xlsm, xls, etc.
+        
     if excluir_patrones is None:
         excluir_patrones = ["COVID", "covid"]
     

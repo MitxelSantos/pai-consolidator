@@ -366,13 +366,14 @@ class PaiProcessor:
             
             return pd.DataFrame()
     
-    def procesar_archivos_paralelo(self, archivos, max_workers=None):
+    def procesar_archivos_paralelo(self, archivos, max_workers=None, batch_size=50):
         """
         Procesa múltiples archivos PAI en paralelo para mejorar rendimiento.
         
         Args:
             archivos: Lista de rutas de archivos a procesar.
             max_workers: Número máximo de procesos (None = auto).
+            batch_size: Tamaño del lote para procesar archivos en grupos.
             
         Returns:
             DataFrame consolidado con todos los datos.
@@ -383,49 +384,111 @@ class PaiProcessor:
         
         print(f"Procesando {len(archivos)} archivos en paralelo con {max_workers} procesos...")
         
-        # Lista para almacenar resultados
-        resultados = []
+        # Función para normalizar tipos en un DataFrame
+        def normalizar_tipos(df):
+            # Convertir columnas de fecha a datetime
+            for col in df.columns:
+                col_str = str(col).lower()
+                # Normalizar columnas de fecha
+                if 'fecha' in col_str and df[col].dtype != 'datetime64[ns]':
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                    except:
+                        pass
+            return df
         
-        # Usar ProcessPoolExecutor para procesamiento paralelo
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Enviar trabajos - utilizando la función a nivel de módulo
-            futuros = {executor.submit(
-                _procesar_archivo_worker_paralelo, 
-                archivo, 
-                self.modo_detallado
-            ): archivo for archivo in archivos}
+        # Dividir archivos en lotes para reducir uso de memoria
+        lotes = [archivos[i:i + batch_size] for i in range(0, len(archivos), batch_size)]
+        print(f"Dividiendo procesamiento en {len(lotes)} lotes de hasta {batch_size} archivos")
+        
+        # DataFrame final consolidado
+        df_final = None
+        
+        # Procesar archivos por lotes
+        for num_lote, lote_archivos in enumerate(lotes, 1):
+            print(f"\nProcesando lote {num_lote}/{len(lotes)} ({len(lote_archivos)} archivos)")
             
-            # Procesar resultados a medida que se completan
-            for i, futuro in enumerate(as_completed(futuros), 1):
-                archivo = futuros[futuro]
+            # Lista para almacenar resultados del lote
+            resultados_lote = []
+            
+            # Usar ProcessPoolExecutor para procesamiento paralelo
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Enviar trabajos - utilizando la función a nivel de módulo
+                futuros = {executor.submit(
+                    _procesar_archivo_worker_paralelo, 
+                    archivo, 
+                    self.modo_detallado
+                ): archivo for archivo in lote_archivos}
+                
+                # Procesar resultados a medida que se completan
+                for i, futuro in enumerate(as_completed(futuros), 1):
+                    archivo = futuros[futuro]
+                    try:
+                        df, num_registros, advertencias_archivo = futuro.result()
+                        
+                        if not df.empty:
+                            # Normalizar tipos de datos
+                            df = normalizar_tipos(df)
+                            resultados_lote.append(df)
+                            self.archivos_procesados += 1
+                            self.registros_totales += num_registros
+                            print(f"[{i}/{len(lote_archivos)}] Procesado: {os.path.basename(archivo)} ({num_registros} registros)")
+                        else:
+                            print(f"[{i}/{len(lote_archivos)}] Sin datos: {os.path.basename(archivo)}")
+                        
+                        # Registrar advertencias
+                        for adv in advertencias_archivo:
+                            self.advertencias.append(adv)
+                            if self.modo_detallado:
+                                print(f"  - {adv}")
+                        
+                    except Exception as e:
+                        error_msg = f"Error al procesar {os.path.basename(archivo)}: {str(e)}"
+                        self.advertencias.append(error_msg)
+                        print(f"[{i}/{len(lote_archivos)}] {error_msg}")
+            
+            # Combinar los DataFrames del lote actual
+            if resultados_lote:
+                print(f"Combinando {len(resultados_lote)} archivos del lote {num_lote}...")
                 try:
-                    df, num_registros, advertencias_archivo = futuro.result()
+                    # Asegurar que todos los DataFrames tengan las mismas columnas
+                    columnas_comunes = set.intersection(*[set(df.columns) for df in resultados_lote])
+                    print(f"  Usando {len(columnas_comunes)} columnas comunes")
                     
-                    if not df.empty:
-                        resultados.append(df)
-                        self.archivos_procesados += 1
-                        self.registros_totales += num_registros
-                        print(f"[{i}/{len(archivos)}] Procesado: {os.path.basename(archivo)} ({num_registros} registros)")
+                    # Utilizar solo columnas comunes para concatenar
+                    resultados_filtrados = [df[list(columnas_comunes)] for df in resultados_lote]
+                    df_lote = pd.concat(resultados_filtrados, ignore_index=True)
+                    
+                    # Concatenar con el DataFrame final
+                    if df_final is None:
+                        df_final = df_lote
                     else:
-                        print(f"[{i}/{len(archivos)}] Sin datos: {os.path.basename(archivo)}")
+                        # Asegurar columnas compatibles entre lotes
+                        columnas_finales = set(df_final.columns)
+                        columnas_lote = set(df_lote.columns)
+                        columnas_compatibles = list(columnas_finales.intersection(columnas_lote))
+                        
+                        df_final = pd.concat([df_final[columnas_compatibles], df_lote[columnas_compatibles]], 
+                                            ignore_index=True)
                     
-                    # Registrar advertencias
-                    for adv in advertencias_archivo:
-                        self.advertencias.append(adv)
-                        if self.modo_detallado:
-                            print(f"  - {adv}")
+                    print(f"  Lote {num_lote} combinado: {len(df_lote)} registros")
+                    
+                    # Liberar memoria explícitamente
+                    del resultados_lote
+                    del resultados_filtrados
+                    del df_lote
+                    import gc
+                    gc.collect()
                     
                 except Exception as e:
-                    error_msg = f"Error al procesar {os.path.basename(archivo)}: {str(e)}"
+                    error_msg = f"Error al combinar lote {num_lote}: {str(e)}"
                     self.advertencias.append(error_msg)
-                    print(f"[{i}/{len(archivos)}] {error_msg}")
+                    print(f"  - {error_msg}")
         
-        # Combinar todos los DataFrames
-        if resultados:
-            print(f"\nCombinando {len(resultados)} archivos procesados...")
-            df_combinado = pd.concat(resultados, ignore_index=True)
-            print(f"Consolidación completada: {len(df_combinado)} registros totales")
-            return df_combinado
+        # Verificar resultado final
+        if df_final is not None and not df_final.empty:
+            print(f"\nConsolidación completada: {len(df_final)} registros totales")
+            return df_final
         else:
             print("No se pudo procesar ningún archivo correctamente.")
             return pd.DataFrame()
